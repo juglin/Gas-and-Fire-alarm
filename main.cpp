@@ -31,10 +31,15 @@ const unsigned long SAMPLE_PERIOD_MS = 250UL;
 const unsigned long REPORT_PERIOD_MS = 1000UL;
 const unsigned long DHT_PERIOD_MS = 3000UL;
 
-const float EMA_ALPHA = 0.10f;
+const float EMA_ALPHA = 0.05f; // หนืดขึ้นเพื่อลดแกว่ง
 
 const float RISE_MQ2 = 1.25f, FALL_MQ2 = 1.12f;
 const float RISE_MQ6 = 1.40f, FALL_MQ6 = 1.18f;
+
+// หน่วงเวลา/ค้างสถานะ
+const unsigned long ASSERT_HOLD_MS = 1500;
+const unsigned long CLEAR_HOLD_MS = 7000;
+const unsigned long MIN_ON_MS = 3000;
 
 enum Stage
 {
@@ -62,6 +67,11 @@ bool buzzer_on = false;
 unsigned long t_buzz = 0;
 
 float last_tempC = NAN;
+
+// สถานะ + ตัวจับเวลา debounced
+bool smoke = false, gas = false;
+unsigned long gas_assert_start = 0, gas_clear_start = 0, gas_on_since = 0;
+unsigned long smoke_assert_start = 0, smoke_clear_start = 0, smoke_on_since = 0;
 
 int readADC(int pin) { return analogRead(pin); }
 void emaUpdate(float x, float &e)
@@ -128,12 +138,12 @@ void IRAM_ATTR isr_mq6()
   }
 }
 
-void drawUI(bool smoke, bool gas, float tempC)
+void drawUI(bool smoke_, bool gas_, float tempC)
 {
   display.clearDisplay();
-  bool both = smoke && gas;
-  const char *msg = both ? "SMK+GAS" : (smoke ? "SMOKE" : (gas ? "GAS" : "SAFE"));
-  if (smoke || gas)
+  bool both = smoke_ && gas_;
+  const char *msg = both ? "SMK+GAS" : (smoke_ ? "SMOKE" : (gas_ ? "GAS" : "SAFE"));
+  if (smoke_ || gas_)
   {
     display.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
     display.setTextColor(SSD1306_BLACK);
@@ -176,7 +186,7 @@ void setup()
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
-    display.println("MQ2+MQ6+DHT11 (Temp only)");
+    display.println("MQ2+MQ6+DHT11");
     display.display();
   }
   analogReadResolution(12);
@@ -184,22 +194,25 @@ void setup()
   analogSetPinAttenuation(MQ6_AO_PIN, ADC_11db);
   pinMode(MQ2_AO_PIN, INPUT);
   pinMode(MQ6_AO_PIN, INPUT);
+
   if (USE_DO_MQ2)
   {
-    pinMode(MQ2_DO_PIN, INPUT);
+    pinMode(MQ2_DO_PIN, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(MQ2_DO_PIN), isr_mq2, CHANGE);
   }
   if (USE_DO_MQ6)
   {
-    pinMode(MQ6_DO_PIN, INPUT);
+    pinMode(MQ6_DO_PIN, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(MQ6_DO_PIN), isr_mq6, CHANGE);
   }
+
   if (USE_BUZZER)
   {
     ledcSetup(BUZZ_CH, BUZZ_PWM_FREQ, 8);
     ledcAttachPin(BUZZER_PIN, BUZZ_CH);
     buzzerStop();
   }
+
   dht.begin();
   t_start = t_lastSamp = t_lastRep = t_lastDHT = millis();
   t_lastRebase = millis();
@@ -209,6 +222,7 @@ void setup()
 void loop()
 {
   unsigned long now = millis();
+
   if (now - t_lastDHT >= DHT_PERIOD_MS)
   {
     t_lastDHT = now;
@@ -216,6 +230,7 @@ void loop()
     if (!isnan(t))
       last_tempC = t;
   }
+
   if (now - t_lastSamp >= SAMPLE_PERIOD_MS)
   {
     t_lastSamp = now;
@@ -223,6 +238,7 @@ void loop()
     int adc6 = readADC(MQ6_AO_PIN);
     emaUpdate((float)adc2, ema2);
     emaUpdate((float)adc6, ema6);
+
     switch (stage)
     {
     case WARMUP:
@@ -252,49 +268,99 @@ void loop()
       break;
     }
   }
-  static bool smoke = false, gas = false;
-  bool by_ratio2 = false, by_ratio6 = false, by_do2 = false, by_do6 = false;
+
   if (stage == RUN)
   {
-    if (!isnan(ema2) && base2 > 0)
-    {
-      float r2 = ema2 / base2;
-      if (!smoke && r2 >= RISE_MQ2)
-        by_ratio2 = true;
-      else if (smoke && r2 >= FALL_MQ2)
-        by_ratio2 = true;
-    }
-    if (!isnan(ema6) && base6 > 0)
-    {
-      float r6 = ema6 / base6;
-      if (!gas && r6 >= RISE_MQ6)
-        by_ratio6 = true;
-      else if (gas && r6 >= FALL_MQ6)
-        by_ratio6 = true;
-    }
+    float r2 = (!isnan(ema2) && base2 > 0) ? (ema2 / base2) : 1.0f;
+    float r6 = (!isnan(ema6) && base6 > 0) ? (ema6 / base6) : 1.0f;
+
+    bool do2_low = false, do6_low = false;
     if (USE_DO_MQ2)
-    {
-      int d2 = digitalRead(MQ2_DO_PIN);
-      by_do2 = (d2 == LOW);
-      if (do2_trig)
-        do2_trig = false;
-    }
+      do2_low = (digitalRead(MQ2_DO_PIN) == LOW);
     if (USE_DO_MQ6)
+      do6_low = (digitalRead(MQ6_DO_PIN) == LOW);
+    do2_trig = false;
+    do6_trig = false;
+
+    bool hazard6 = (r6 >= RISE_MQ6) || (USE_DO_MQ6 && do6_low);
+    bool quiet6 = (r6 < FALL_MQ6) && (!USE_DO_MQ6 || !do6_low);
+
+    if (!gas)
     {
-      int d6 = digitalRead(MQ6_DO_PIN);
-      by_do6 = (d6 == LOW);
-      if (do6_trig)
-        do6_trig = false;
+      if (hazard6)
+      {
+        if (gas_assert_start == 0)
+          gas_assert_start = now;
+        if (now - gas_assert_start >= ASSERT_HOLD_MS)
+        {
+          gas = true;
+          gas_on_since = now;
+          gas_clear_start = 0;
+        }
+      }
+      else
+        gas_assert_start = 0;
     }
-    bool new_smoke = by_ratio2 || (USE_DO_MQ2 && by_do2);
-    bool new_gas = by_ratio6 || (USE_DO_MQ6 && by_do6);
-    bool any_old = smoke || gas;
-    bool any_new = new_smoke || new_gas;
+    else
+    {
+      bool min_on_ok = (now - gas_on_since >= MIN_ON_MS);
+      if (quiet6 && min_on_ok)
+      {
+        if (gas_clear_start == 0)
+          gas_clear_start = now;
+        if (now - gas_clear_start >= CLEAR_HOLD_MS)
+        {
+          gas = false;
+          gas_assert_start = 0;
+        }
+      }
+      else
+        gas_clear_start = 0;
+    }
+
+    bool hazard2 = (r2 >= RISE_MQ2) || (USE_DO_MQ2 && do2_low);
+    bool quiet2 = (r2 < FALL_MQ2) && (!USE_DO_MQ2 || !do2_low);
+
+    if (!smoke)
+    {
+      if (hazard2)
+      {
+        if (smoke_assert_start == 0)
+          smoke_assert_start = now;
+        if (now - smoke_assert_start >= ASSERT_HOLD_MS)
+        {
+          smoke = true;
+          smoke_on_since = now;
+          smoke_clear_start = 0;
+        }
+      }
+      else
+        smoke_assert_start = 0;
+    }
+    else
+    {
+      bool min_on_ok2 = (now - smoke_on_since >= MIN_ON_MS);
+      if (quiet2 && min_on_ok2)
+      {
+        if (smoke_clear_start == 0)
+          smoke_clear_start = now;
+        if (now - smoke_clear_start >= CLEAR_HOLD_MS)
+        {
+          smoke = false;
+          smoke_assert_start = 0;
+        }
+      }
+      else
+        smoke_clear_start = 0;
+    }
+
+    bool any_new = smoke || gas;
+    static bool any_old = false;
     if (any_old && !any_new)
       buzzerStop();
-    smoke = new_smoke;
-    gas = new_gas;
     buzzerTick(any_new);
+    any_old = any_new;
+
     if (!any_new)
     {
       if (now - t_lastRebase >= SAFE_REBASE_INTERVAL_MS)
@@ -305,9 +371,7 @@ void loop()
       }
     }
     else
-    {
       t_lastRebase = now;
-    }
   }
   else
   {
@@ -315,6 +379,7 @@ void loop()
     smoke = false;
     gas = false;
   }
+
   if (now - t_lastRep >= REPORT_PERIOD_MS)
   {
     t_lastRep = now;
